@@ -13,7 +13,7 @@ import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
-import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+
 
 @Component
 public class EventClient {
@@ -86,19 +86,5 @@ public class EventClient {
         );
     }
 
-
-    // Fallback when the Circuit Breaker is already OPEN.
-    private EventServiceResponseDTO eventServiceFallback(
-            Long eventId,
-            CallNotPermittedException ex) {
-
-        System.out.println(
-                "Fallback executed: Circuit Breaker is OPEN."
-        );
-
-        throw new EventServiceUnavailableException(
-                "Event Service is temporarily unavailable. "
-                        + "Please try again later."
-        );
-    }
+ 
 }
