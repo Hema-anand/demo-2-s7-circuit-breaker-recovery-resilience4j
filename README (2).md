@@ -85,7 +85,7 @@ Confirm that Event Service is registered in Eureka.
 
 ---
 
-## Test Request
+## Sample Request
 
 Use Postman:
 
