@@ -28,11 +28,11 @@ Booking Service
       ↓
 Retry
       ↓
-Circuit Breaker
+Circuit Breaker ──── OPEN ────→ call blocked → 503 (exception handler)
       ↓
 Event Service
       ↓
-Fallback when unavailable
+Failure → Fallback → 503
 ```
 
 The goal is to observe how the Circuit Breaker reacts when Event Service fails and how it recovers when Event Service becomes available again.
@@ -43,10 +43,31 @@ The goal is to observe how the Circuit Breaker reacts when Event Service fails a
 
 | File | Purpose |
 |---|---|
-| `client/EventClient.java` | Adds fallback methods for Event Service failures and OPEN Circuit Breaker state. |
+| `client/EventClient.java` | Adds a fallback method for Event Service failures. |
 | `config/CircuitBreakerEventLogger.java` | Logs Circuit Breaker state transitions. |
 | `application.properties` | Enables Circuit Breaker health information through Actuator. |
-| `exception/GlobalExceptionHandler.java` | Returns clear `503 Service Unavailable` responses. |
+
+`exception/GlobalExceptionHandler.java` is reused without changes. It already returns `404` for a missing Event and `503` when the Circuit Breaker is OPEN.
+
+---
+
+## Configuration Used in This Demo
+
+The Retry and Circuit Breaker settings are the same as in Demo 1.
+
+| Setting | Value |
+|---|---|
+| Retry maximum attempts | 3 |
+| Retry wait between attempts | 1 second |
+| Retry applies to | Event Service unavailable only |
+| Circuit Breaker sliding window size | 5 calls |
+| Minimum number of calls | 3 |
+| Failure rate threshold | 50% |
+| Wait duration in OPEN state | 10 seconds |
+| Permitted calls in HALF-OPEN state | 2 |
+| Circuit Breaker records | Event Service unavailable only |
+
+Every Retry attempt is a separate call as far as the Circuit Breaker is concerned. Retry runs outside the Circuit Breaker, so a single booking request can add up to 3 calls to the Circuit Breaker's window.
 
 ---
 
@@ -64,7 +85,7 @@ Confirm that Event Service is registered in Eureka.
 
 ---
 
-## Test Request
+## Sample Request
 
 Use Postman:
 
@@ -113,31 +134,64 @@ Circuit Breaker remains CLOSED.
 
 ---
 
-## Step 2 – Stop Event Service
+## Step 2 – Verify a Missing Event
+
+Keep Event Service running.
+
+Send the same request with an Event ID that does not exist, for example `900000`.
+
+Expected console output:
+
+```text
+Attempting Event Service call for eventId: 900000
+```
+
+Expected Postman response:
+
+```text
+404 Event Not Found
+```
+
+### Verified
+
+- The call appears only once, so Retry is not triggered.
+- No fallback line appears.
+- A missing Event is a business error, not a service failure, so the Circuit Breaker does not count it.
+
+---
+
+## Step 3 – Stop Event Service
 
 Stop only Event Service.
 
 Keep Booking Service, Discovery Server and API Gateway running.
 
-Send the same booking request again.
+Send the booking request for Event ID `9`.
 
 Expected console output:
 
 ```text
 Attempting Event Service call for eventId: 9
 Fallback executed: Event Service is unavailable.
-```
-
-After repeated failures:
-
-```text
+Attempting Event Service call for eventId: 9
+Fallback executed: Event Service is unavailable.
+Attempting Event Service call for eventId: 9
 Circuit Breaker State Changed: State transition from CLOSED to OPEN
+Fallback executed: Event Service is unavailable.
 ```
 
-Further requests may show:
+Expected Postman response:
 
 ```text
-Fallback executed: Circuit Breaker is OPEN.
+503 Service Unavailable
+```
+
+Send the request again within 10 seconds.
+
+Expected console output:
+
+```text
+Circuit Breaker OPEN: Event Service calls are temporarily blocked.
 ```
 
 Expected Postman response:
@@ -148,16 +202,16 @@ Expected Postman response:
 
 ### Verified
 
-- Event Service failures trigger fallback.
+- Event Service failures trigger Retry, and each failed attempt runs the fallback.
+- The third failure reaches the minimum number of calls at a 100% failure rate, so the Circuit Breaker moves to OPEN during this first request.
 - Booking is not created when the Event cannot be validated.
-- Repeated failures move the Circuit Breaker to OPEN.
-- OPEN Circuit Breaker blocks unnecessary calls.
+- While the circuit is OPEN, the call is blocked immediately: there is no `Attempting` line, no fallback and no retry.
 
 ---
 
-## Step 3 – Observe OPEN State
+## Step 4 – Observe OPEN State
 
-Check Booking Service health:
+While the circuit is OPEN, check Booking Service health:
 
 ```text
 GET http://localhost:8083/actuator/health
@@ -167,8 +221,9 @@ The Circuit Breaker section should show:
 
 ```text
 state: OPEN
-status: DOWN
+status: CIRCUIT_OPEN
 ```
+The parent `circuitBreakers` entry shows `UNKNOWN`, and the overall `status` stays `UP`. Spring Boot does not recognise `CIRCUIT_OPEN`, so an OPEN circuit does not mark the Booking Service itself as DOWN.
 
 The health details may also show:
 
@@ -179,45 +234,46 @@ The health details may also show:
 
 ---
 
-## Step 4 – Observe HALF-OPEN State
+## Step 5 – Observe HALF-OPEN State While Event Service Is Still Down
 
-The Circuit Breaker is configured to remain OPEN for a short period.
+Keep Event Service stopped.
 
-After the wait duration, send another booking request.
+The Circuit Breaker stays OPEN for 10 seconds. It does not move to HALF-OPEN by itself: the next request after the wait triggers the transition.
+
+Wait at least 10 seconds after the circuit opened, then send the booking request.
 
 Expected console output:
 
 ```text
 Circuit Breaker State Changed: State transition from OPEN to HALF_OPEN
+Attempting Event Service call for eventId: 9
+Fallback executed: Event Service is unavailable.
+Attempting Event Service call for eventId: 9
+Circuit Breaker State Changed: State transition from HALF_OPEN to OPEN
+Fallback executed: Event Service is unavailable.
+Circuit Breaker OPEN: Event Service calls are temporarily blocked.
 ```
 
-HALF-OPEN allows a limited number of test calls to check whether Event Service has recovered.
-
----
-
-## Step 5 – Recovery Failure
-
-If Event Service is still stopped during HALF-OPEN, the test calls fail.
-
-Expected console output:
+Expected Postman response:
 
 ```text
-Circuit Breaker State Changed: State transition from HALF_OPEN to OPEN
+503 Service Unavailable
 ```
 
 ### Verified
 
-HALF-OPEN does not automatically mean recovery.
-
-If Event Service is still unavailable, the Circuit Breaker returns to OPEN.
+- HALF-OPEN allows a limited number of test calls (2 in this demo).
+- Retry attempts are counted as those test calls, so both fail within this single request.
+- HALF-OPEN does not automatically mean recovery. If Event Service is still unavailable, the Circuit Breaker returns to OPEN.
+- The third attempt is blocked by the OPEN circuit and is not retried.
 
 ---
 
 ## Step 6 – Restart Event Service
 
-Start Event Service again.
+Start Event Service again and confirm that it is registered in Eureka.
 
-Wait for the Circuit Breaker to allow HALF-OPEN test calls and send the booking request.
+Wait until at least 10 seconds have passed since the circuit last went OPEN, then send the booking request.
 
 Expected console output:
 
@@ -226,18 +282,21 @@ Circuit Breaker State Changed: State transition from OPEN to HALF_OPEN
 Attempting Event Service call for eventId: 9
 ```
 
-After successful test calls:
+The booking is created, but the circuit stays HALF-OPEN: only one of the two test calls has been used.
+
+Send the booking request again.
+
+Expected console output:
 
 ```text
+Attempting Event Service call for eventId: 9
 Circuit Breaker State Changed: State transition from HALF_OPEN to CLOSED
 ```
-
-The booking should now be created successfully again.
 
 ### Verified
 
 - Event Service recovery is detected.
-- Successful HALF-OPEN calls move the Circuit Breaker back to CLOSED.
+- Both test calls succeeded, so the Circuit Breaker moved back to CLOSED.
 - Normal booking operations resume.
 
 ---
@@ -247,19 +306,19 @@ The booking should now be created successfully again.
 ```text
 CLOSED
   ↓
-Repeated failures
+Failure rate reaches threshold
   ↓
 OPEN
   ↓
-Wait
+Wait 10 seconds, then next request
   ↓
 HALF-OPEN
   ↓
-Failure ─────────→ OPEN
+Test calls fail ─────────→ OPEN
 
 HALF-OPEN
   ↓
-Successful test calls
+Test calls succeed
   ↓
 CLOSED
 ```
@@ -268,7 +327,7 @@ CLOSED
 
 ## Fallback Behaviour
 
-The fallback does not create fake Event data.
+The fallback handles Event Service failures only. It does not create fake Event data.
 
 If Event Service cannot be reached:
 
@@ -283,6 +342,15 @@ Booking is not created
 ```
 
 This prevents invalid bookings while keeping failure handling predictable.
+
+The fallback is matched by exception type. Other exceptions pass through it unchanged:
+
+```text
+Event not found            → no fallback → 404
+Circuit Breaker is OPEN    → no fallback → 503 from the exception handler
+```
+
+A blocked call is rejected immediately, and it is not retried.
 
 ---
 
